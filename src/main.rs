@@ -1,4 +1,5 @@
 mod gguf;
+mod model;
 mod quant;
 mod selftest;
 mod tensor;
@@ -58,6 +59,14 @@ enum Command {
     /// Run tensor ops against a reference file from scripts/check_m4.py
     #[command(hide = true)]
     SelftestM4 {
+        /// Path to the FTEN reference tensor file
+        file: PathBuf,
+    },
+    /// Staged block-0 comparison against a reference file from check_m5.py
+    #[command(hide = true)]
+    SelftestM5 {
+        /// Path to the .gguf model file
+        model: PathBuf,
         /// Path to the FTEN reference tensor file
         file: PathBuf,
     },
@@ -138,6 +147,9 @@ fn main() -> Result<()> {
         }
         Command::SelftestM4 { file } => {
             selftest::run_m4(&file)?;
+        }
+        Command::SelftestM5 { model, file } => {
+            selftest::run_m5(&model, &file)?;
         }
     }
     Ok(())

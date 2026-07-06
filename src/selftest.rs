@@ -7,6 +7,8 @@
 //   per tensor: name_len u32, name bytes, n_dims u32, dims u64[n_dims]
 //               (row-major shape), then f32 data
 
+use crate::gguf::GgufFile;
+use crate::model::{self, Config, Layer};
 use crate::tensor::{self, Tensor};
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::HashMap;
@@ -96,5 +98,87 @@ pub fn run_m4(path: &Path) -> Result<()> {
         bail!("self-test failed");
     }
     println!("all ops match");
+    Ok(())
+}
+
+/// M5: staged comparison of the block-0 forward pass against HF references
+/// from scripts/check_m5.py. Stops at the first failing stage.
+pub fn run_m5(model_path: &Path, ref_path: &Path) -> Result<()> {
+    let refs = load_tensor_file(ref_path)?;
+    let get = |name: &str| -> Result<&Tensor> {
+        refs.get(name).with_context(|| format!("reference file is missing '{}'", name))
+    };
+    let tokens: Vec<u32> = get("tokens")?.data.iter().map(|&v| v as u32).collect();
+
+    let file = GgufFile::open(model_path)?;
+    let config = Config::from_gguf(&file)?;
+    let layer = Layer::load(&file, 0)?;
+    let embedding = Tensor::from_gguf(&file, "token_embd.weight")?;
+    println!("config: {:?}", config);
+    println!("tokens: {:?}", tokens);
+
+    let stage = |n: u32, name: &str, got: &Tensor, want: &Tensor, tol: f32| -> Result<()> {
+        ensure!(
+            check(&format!("stage {} {}", n, name), got, want, tol),
+            "stage {} ({}) failed; stop and debug before continuing",
+            n,
+            name
+        );
+        Ok(())
+    };
+
+    // stage 1: embedding lookup (also cross-validates dequant of the
+    // largest tensor in the file)
+    let x = model::embed(&embedding, &tokens);
+    stage(1, "embeddings", &x, get("embeddings")?, 1e-6)?;
+
+    // stage 2: input RMSNorm
+    let xn = tensor::rmsnorm(&x, &layer.attn_norm, config.rms_eps);
+    stage(2, "post_norm", &xn, get("post_norm")?, 1e-5)?;
+
+    // stage 3: QKV projections with biases (validates matmul convention)
+    let q = model::linear(&xn, &layer.wq, Some(&layer.bq));
+    let k = model::linear(&xn, &layer.wk, Some(&layer.bk));
+    let v = model::linear(&xn, &layer.wv, Some(&layer.bv));
+    stage(3, "q_proj", &q, get("q_proj")?, 5e-5)?;
+    stage(3, "k_proj", &k, get("k_proj")?, 5e-5)?;
+    stage(3, "v_proj", &v, get("v_proj")?, 5e-5)?;
+
+    // stage 4: RoPE (validates the half-split pairing convention)
+    let mut q = q;
+    let mut k = k;
+    model::rope(&mut q, config.n_heads, config.head_dim, config.rope_theta);
+    model::rope(&mut k, config.n_kv_heads, config.head_dim, config.rope_theta);
+    stage(4, "q_rope", &q, get("q_rope")?, 5e-5)?;
+    stage(4, "k_rope", &k, get("k_rope")?, 5e-5)?;
+
+    // stage 5: attention probabilities (validates GQA mapping, scaling,
+    // causal mask). Tolerance: logits are O(10) with ~1e-6 relative noise
+    // inherited from stages 3-4; softmax maps that to ~3e-5 in the probs.
+    // Structure (mask zeros, GQA routing) is pinned exactly by unit tests.
+    let probs = model::attention_scores(&q, &k, config.n_heads, config.n_kv_heads, config.head_dim);
+    stage(5, "attn_probs", &probs, get("attn_probs")?, 2e-4)?;
+
+    // stage 6: the rest of the block, sub-step by sub-step for localization,
+    // then the assembled layer_forward end to end
+    let ctx = model::attention_apply(&probs, &v, config.n_heads, config.n_kv_heads, config.head_dim);
+    stage(6, "attn_pre_o", &ctx, get("attn_pre_o")?, 2e-4)?;
+    let attn = model::linear(&ctx, &layer.wo, None);
+    stage(6, "attn_out", &attn, get("attn_out")?, 2e-4)?;
+    let h1 = tensor::add(&x, &attn);
+    stage(6, "resid1", &h1, get("resid1")?, 2e-4)?;
+    let hn = tensor::rmsnorm(&h1, &layer.ffn_norm, config.rms_eps);
+    stage(6, "post_attn_norm", &hn, get("post_attn_norm")?, 2e-4)?;
+    let gate = model::linear(&hn, &layer.w_gate, None);
+    let up = model::linear(&hn, &layer.w_up, None);
+    stage(6, "ffn_gate", &gate, get("ffn_gate")?, 2e-4)?;
+    stage(6, "ffn_up", &up, get("ffn_up")?, 2e-4)?;
+    let ffn = model::linear(&tensor::swiglu(&gate, &up), &layer.w_down, None);
+    stage(6, "ffn_out", &ffn, get("ffn_out")?, 2e-4)?;
+
+    let block = model::layer_forward(&x, &layer, &config);
+    stage(6, "block_out (layer_forward)", &block, get("block_out")?, 2e-4)?;
+
+    println!("all stages green");
     Ok(())
 }

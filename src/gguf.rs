@@ -147,6 +147,14 @@ impl GgufValue {
         }
     }
 
+    pub fn as_f32(&self) -> Option<f32> {
+        match *self {
+            GgufValue::F32(v) => Some(v),
+            GgufValue::F64(v) => Some(v as f32),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             GgufValue::String(s) => Some(s),
@@ -373,6 +381,20 @@ impl GgufFile {
             .get(key)
             .and_then(|v| v.as_str())
             .with_context(|| format!("metadata key '{}' missing or not a string", key))
+    }
+
+    pub fn meta_u32(&self, key: &str) -> Result<u32> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_u32())
+            .with_context(|| format!("metadata key '{}' missing or not a u32", key))
+    }
+
+    pub fn meta_f32(&self, key: &str) -> Result<f32> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_f32())
+            .with_context(|| format!("metadata key '{}' missing or not a float", key))
     }
 
     pub fn meta_array(&self, key: &str) -> Result<&[GgufValue]> {
