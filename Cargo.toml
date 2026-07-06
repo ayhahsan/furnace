@@ -1,0 +1,13 @@
+[package]
+name = "furnace"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+half = "2"
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+
+[profile.release]
+debug = true
