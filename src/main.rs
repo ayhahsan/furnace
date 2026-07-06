@@ -1,5 +1,7 @@
 mod gguf;
 mod quant;
+mod selftest;
+mod tensor;
 mod tokenizer;
 
 use anyhow::{ensure, Context, Result};
@@ -52,6 +54,12 @@ enum Command {
         /// Token ids, e.g. --ids 9707,11,1879 (empty string decodes nothing)
         #[arg(long)]
         ids: String,
+    },
+    /// Run tensor ops against a reference file from scripts/check_m4.py
+    #[command(hide = true)]
+    SelftestM4 {
+        /// Path to the FTEN reference tensor file
+        file: PathBuf,
     },
 }
 
@@ -127,6 +135,9 @@ fn main() -> Result<()> {
             let mut out = std::io::stdout();
             out.write_all(text.as_bytes())?;
             out.write_all(b"\n")?;
+        }
+        Command::SelftestM4 { file } => {
+            selftest::run_m4(&file)?;
         }
     }
     Ok(())
