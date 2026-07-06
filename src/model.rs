@@ -24,8 +24,6 @@ use crate::tensor::{self, Tensor};
 use anyhow::{ensure, Result};
 
 #[derive(Debug, Clone)]
-// n_layers and vocab are read starting with the M6 full forward pass
-#[allow(dead_code)]
 pub struct Config {
     pub n_layers: usize,
     pub n_heads: usize,
@@ -256,6 +254,75 @@ pub fn embed(embedding: &Tensor, tokens: &[u32]) -> Tensor {
             .copy_from_slice(&embedding.data[t * hidden..(t + 1) * hidden]);
     }
     out
+}
+
+/// The whole network: embedding, all blocks, final norm, lm_head.
+/// Everything is dequantized to f32 up front (~2.4 GB for 0.5B; M10 will
+/// dequantize on the fly instead).
+pub struct Model {
+    pub config: Config,
+    pub embedding: Tensor,   // [vocab, hidden]
+    pub layers: Vec<Layer>,
+    pub output_norm: Tensor, // [hidden]
+    pub lm_head: Tensor,     // [vocab, hidden]; GGUF stores it even though
+                             // Qwen2.5-0.5B ties it to the embedding
+}
+
+impl Model {
+    pub fn load(file: &GgufFile) -> Result<Model> {
+        let config = Config::from_gguf(file)?;
+        let embedding = Tensor::from_gguf(file, "token_embd.weight")?;
+        ensure!(
+            embedding.shape == vec![config.vocab, config.hidden],
+            "token_embd shape {:?} does not match config", embedding.shape
+        );
+        let layers = (0..config.n_layers)
+            .map(|i| Layer::load(file, i))
+            .collect::<Result<Vec<_>>>()?;
+        for (i, l) in layers.iter().enumerate() {
+            ensure!(
+                l.w_gate.shape == vec![config.ffn, config.hidden],
+                "blk.{} ffn_gate shape {:?}, expected [{}, {}]",
+                i, l.w_gate.shape, config.ffn, config.hidden
+            );
+        }
+        let output_norm = Tensor::from_gguf(file, "output_norm.weight")?;
+        let lm_head = Tensor::from_gguf(file, "output.weight")?;
+        ensure!(
+            lm_head.shape == vec![config.vocab, config.hidden],
+            "output.weight shape {:?} does not match config", lm_head.shape
+        );
+        Ok(Model { config, embedding, layers, output_norm, lm_head })
+    }
+
+    /// Total f32 bytes held by the dequantized weights.
+    pub fn param_bytes(&self) -> usize {
+        let layer_elems: usize = self.layers.iter().map(|l| {
+            [
+                &l.attn_norm, &l.wq, &l.bq, &l.wk, &l.bk, &l.wv, &l.bv, &l.wo,
+                &l.ffn_norm, &l.w_gate, &l.w_up, &l.w_down,
+            ]
+            .iter()
+            .map(|t| t.numel())
+            .sum::<usize>()
+        }).sum();
+        (layer_elems + self.embedding.numel() + self.output_norm.numel() + self.lm_head.numel()) * 4
+    }
+
+    /// Run the full network and return logits for the LAST position only:
+    /// [1, vocab]. Greedy decoding never needs the other rows, and the
+    /// lm_head matmul is the single most expensive op in the model.
+    pub fn forward_last(&self, tokens: &[u32]) -> Tensor {
+        let mut x = embed(&self.embedding, tokens);
+        for layer in &self.layers {
+            x = layer_forward(&x, layer, &self.config);
+        }
+        let xn = tensor::rmsnorm(&x, &self.output_norm, self.config.rms_eps);
+        let hidden = self.config.hidden;
+        let last_row = xn.data[(xn.shape[0] - 1) * hidden..].to_vec();
+        let last = Tensor::from_vec(last_row, vec![1, hidden]);
+        linear(&last, &self.lm_head, None)
+    }
 }
 
 #[cfg(test)]

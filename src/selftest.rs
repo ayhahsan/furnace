@@ -8,7 +8,7 @@
 //               (row-major shape), then f32 data
 
 use crate::gguf::GgufFile;
-use crate::model::{self, Config, Layer};
+use crate::model::{self, Config, Layer, Model};
 use crate::tensor::{self, Tensor};
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::HashMap;
@@ -180,5 +180,48 @@ pub fn run_m5(model_path: &Path, ref_path: &Path) -> Result<()> {
     stage(6, "block_out (layer_forward)", &block, get("block_out")?, 2e-4)?;
 
     println!("all stages green");
+    Ok(())
+}
+
+/// M6 stage A: full 24-layer forward, last-position logits vs HF.
+/// The logits tolerance is loose (24 layers of f32 accumulation) but the
+/// argmax must match exactly and the top-5 ids must match in order.
+pub fn run_m6(model_path: &Path, ref_path: &Path) -> Result<()> {
+    let refs = load_tensor_file(ref_path)?;
+    let get = |name: &str| -> Result<&Tensor> {
+        refs.get(name).with_context(|| format!("reference file is missing '{}'", name))
+    };
+    let tokens: Vec<u32> = get("tokens")?.data.iter().map(|&v| v as u32).collect();
+    let want = get("logits_last")?;
+
+    let file = GgufFile::open(model_path)?;
+    let t0 = std::time::Instant::now();
+    let m = Model::load(&file)?;
+    println!(
+        "loaded {:.0} MB of f32 weights in {:.1} s",
+        m.param_bytes() as f64 / (1024.0 * 1024.0),
+        t0.elapsed().as_secs_f64()
+    );
+
+    let t0 = std::time::Instant::now();
+    let logits = m.forward_last(&tokens);
+    println!("forward over {} tokens took {:.2} s", tokens.len(), t0.elapsed().as_secs_f64());
+
+    let ok = check("last-position logits", &logits, want, 5e-3);
+
+    let top5 = |data: &[f32]| -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..data.len()).collect();
+        idx.sort_by(|&a, &b| data[b].partial_cmp(&data[a]).unwrap());
+        idx.truncate(5);
+        idx
+    };
+    let ours = top5(&logits.data);
+    let theirs = top5(&want.data);
+    println!("our top-5:  {:?}", ours);
+    println!("ref top-5:  {:?}", theirs);
+    ensure!(ours[0] == theirs[0], "argmax differs: {} vs {}", ours[0], theirs[0]);
+    ensure!(ours == theirs, "top-5 order differs");
+    ensure!(ok, "logits diff exceeded tolerance");
+    println!("argmax and top-5 match exactly");
     Ok(())
 }

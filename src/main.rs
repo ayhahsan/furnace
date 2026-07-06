@@ -1,3 +1,4 @@
+mod generate;
 mod gguf;
 mod model;
 mod quant;
@@ -19,6 +20,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Generate text with greedy decoding
+    Run {
+        /// Path to the .gguf model file
+        model: PathBuf,
+        /// User prompt
+        #[arg(short, long)]
+        prompt: String,
+        /// Maximum new tokens to generate
+        #[arg(short = 'n', long, default_value_t = 50)]
+        max_tokens: usize,
+        /// Feed the prompt as-is instead of wrapping it in the chat template
+        #[arg(long)]
+        raw: bool,
+    },
     /// Parse a GGUF file and dump its metadata and tensor table
     Inspect {
         /// Path to the .gguf model file
@@ -65,6 +80,14 @@ enum Command {
     /// Staged block-0 comparison against a reference file from check_m5.py
     #[command(hide = true)]
     SelftestM5 {
+        /// Path to the .gguf model file
+        model: PathBuf,
+        /// Path to the FTEN reference tensor file
+        file: PathBuf,
+    },
+    /// Full-forward logits comparison against a reference from check_m6.py
+    #[command(hide = true)]
+    SelftestM6 {
         /// Path to the .gguf model file
         model: PathBuf,
         /// Path to the FTEN reference tensor file
@@ -150,6 +173,32 @@ fn main() -> Result<()> {
         }
         Command::SelftestM5 { model, file } => {
             selftest::run_m5(&model, &file)?;
+        }
+        Command::SelftestM6 { model, file } => {
+            selftest::run_m6(&model, &file)?;
+        }
+        Command::Run { model, prompt, max_tokens, raw } => {
+            let t0 = std::time::Instant::now();
+            let file = gguf::GgufFile::open(&model)?;
+            let tok = tokenizer::Tokenizer::from_gguf(&file)?;
+            let m = model::Model::load(&file)?;
+            eprintln!(
+                "loaded {:.0} MB of f32 weights in {:.1} s (dequantized up front; M10 moves this on the fly)",
+                m.param_bytes() as f64 / (1024.0 * 1024.0),
+                t0.elapsed().as_secs_f64()
+            );
+
+            let text = if raw { prompt } else { generate::chat_template(&prompt) };
+            let ids = tok.encode(&text)?;
+            eprintln!("prompt: {} tokens", ids.len());
+
+            // stop on <|im_end|> (eos) and <|endoftext|> (bos doubles as the
+            // pretraining document separator for qwen2)
+            let stop_ids = [
+                file.meta_u32("tokenizer.ggml.eos_token_id")?,
+                file.meta_u32("tokenizer.ggml.bos_token_id")?,
+            ];
+            generate::generate(&m, &tok, ids, max_tokens, &stop_ids)?;
         }
     }
     Ok(())

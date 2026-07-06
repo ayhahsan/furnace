@@ -151,23 +151,31 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         let mut bytes = Vec::new();
         for &id in ids {
-            let token = self
-                .vocab
-                .get(id as usize)
-                .with_context(|| format!("token id {} out of range", id))?;
-            if self.is_special[id as usize] {
-                // special tokens are stored as literal text, not byte-mapped
-                bytes.extend_from_slice(token.as_bytes());
-            } else {
-                for c in token.chars() {
-                    match self.char_to_byte.get(&c) {
-                        Some(&b) => bytes.push(b),
-                        None => bytes.extend_from_slice(c.to_string().as_bytes()),
-                    }
+            bytes.extend_from_slice(&self.token_bytes(id)?);
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Raw bytes of one token. May be a partial UTF-8 sequence; callers that
+    /// stream must buffer until a complete character is available.
+    pub fn token_bytes(&self, id: u32) -> Result<Vec<u8>> {
+        let token = self
+            .vocab
+            .get(id as usize)
+            .with_context(|| format!("token id {} out of range", id))?;
+        let mut bytes = Vec::with_capacity(token.len());
+        if self.is_special[id as usize] {
+            // special tokens are stored as literal text, not byte-mapped
+            bytes.extend_from_slice(token.as_bytes());
+        } else {
+            for c in token.chars() {
+                match self.char_to_byte.get(&c) {
+                    Some(&b) => bytes.push(b),
+                    None => bytes.extend_from_slice(c.to_string().as_bytes()),
                 }
             }
         }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(bytes)
     }
 
     /// Split text into literal special-token matches (leftmost, longest) and
@@ -340,6 +348,29 @@ mod tests {
         let t = tiny();
         assert_eq!(t.encode("").unwrap(), Vec::<u32>::new());
         assert_eq!(t.decode(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn chat_template_matches_hf_apply_chat_template() {
+        // expected ids come from HF AutoTokenizer.apply_chat_template for
+        // [{role: user, content: "Hi"}] with add_generation_prompt=True,
+        // captured once (scripts/check_m6.py re-verifies the template string)
+        let path = std::path::Path::new("../models/qwen2.5-0.5b-instruct-q8_0.gguf");
+        if !path.exists() {
+            eprintln!("skipped: model file not present");
+            return;
+        }
+        let file = crate::gguf::GgufFile::open(path).unwrap();
+        let tok = Tokenizer::from_gguf(&file).unwrap();
+        let ids = tok.encode(&crate::generate::chat_template("Hi")).unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553,
+                54364, 14817, 13, 1446, 525, 264, 10950, 17847, 13, 151645,
+                198, 151644, 872, 198, 13048, 151645, 198, 151644, 77091, 198
+            ]
+        );
     }
 
     #[test]
