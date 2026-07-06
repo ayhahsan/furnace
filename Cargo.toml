@@ -7,6 +7,9 @@ edition = "2021"
 anyhow = "1"
 half = "2"
 clap = { version = "4", features = ["derive"] }
+# Pre-tokenizer splitting only: Qwen's pattern needs lookahead, which the
+# plain regex crate does not support.
+fancy-regex = "0.14"
 memmap2 = "0.9"
 
 [profile.release]

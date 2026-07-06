@@ -132,6 +132,34 @@ impl GgufValue {
             _ => None,
         }
     }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match *self {
+            GgufValue::U8(v) => Some(v as i64),
+            GgufValue::I8(v) => Some(v as i64),
+            GgufValue::U16(v) => Some(v as i64),
+            GgufValue::I16(v) => Some(v as i64),
+            GgufValue::U32(v) => Some(v as i64),
+            GgufValue::I32(v) => Some(v as i64),
+            GgufValue::U64(v) => i64::try_from(v).ok(),
+            GgufValue::I64(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            GgufValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&[GgufValue]> {
+        match self {
+            GgufValue::Array(items) => Some(items),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +366,20 @@ impl GgufFile {
             tensors: parsed.tensors,
             data_start: parsed.data_start,
         })
+    }
+
+    pub fn meta_str(&self, key: &str) -> Result<&str> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("metadata key '{}' missing or not a string", key))
+    }
+
+    pub fn meta_array(&self, key: &str) -> Result<&[GgufValue]> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_array())
+            .with_context(|| format!("metadata key '{}' missing or not an array", key))
     }
 
     /// Look up a tensor by name and return its info plus the raw byte slice
