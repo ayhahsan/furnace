@@ -1,0 +1,2 @@
+# No line-ending normalization: files are committed and checked out byte-for-byte.
+* -text
