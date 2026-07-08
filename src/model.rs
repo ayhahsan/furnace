@@ -34,6 +34,7 @@ pub struct Config {
     pub rope_theta: f32,
     pub rms_eps: f32,
     pub vocab: usize,
+    pub context_length: usize,
 }
 
 impl Config {
@@ -54,6 +55,7 @@ impl Config {
             rope_theta: file.meta_f32("qwen2.rope.freq_base")?,
             rms_eps: file.meta_f32("qwen2.attention.layer_norm_rms_epsilon")?,
             vocab: file.meta_array("tokenizer.ggml.tokens")?.len(),
+            context_length: file.meta_u32("qwen2.context_length")? as usize,
         })
     }
 }
@@ -117,9 +119,10 @@ pub fn linear(x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Tensor {
 
 /// Rotary position embedding, half-split (NeoX) pairing as used by HF Qwen2:
 /// within each head, dimension i pairs with i + head_dim/2 and the pair is
-/// rotated by pos * theta^(-2i/head_dim). Row s of x is at position s.
-/// Applied in place to Q or K; V is never rotated.
-pub fn rope(x: &mut Tensor, n_heads: usize, head_dim: usize, theta: f32) {
+/// rotated by pos * theta^(-2i/head_dim). Row s of x is at ABSOLUTE position
+/// start_pos + s: with a KV cache, a decoded token is row 0 of its batch but
+/// is not at position 0. Applied in place to Q or K; V is never rotated.
+pub fn rope(x: &mut Tensor, n_heads: usize, head_dim: usize, theta: f32, start_pos: usize) {
     let seq = x.shape[0];
     assert_eq!(
         x.shape[1],
@@ -134,7 +137,7 @@ pub fn rope(x: &mut Tensor, n_heads: usize, head_dim: usize, theta: f32) {
             let head = &mut row[h * head_dim..(h + 1) * head_dim];
             for i in 0..half {
                 let freq = theta.powf(-2.0 * i as f32 / head_dim as f32);
-                let angle = s as f32 * freq;
+                let angle = (start_pos + s) as f32 * freq;
                 let (sin, cos) = angle.sin_cos();
                 let (a, b) = (head[i], head[i + half]);
                 head[i] = a * cos - b * sin;
@@ -227,14 +230,174 @@ pub fn layer_forward(x: &Tensor, layer: &Layer, config: &Config) -> Tensor {
     let mut q = linear(&xn, &layer.wq, Some(&layer.bq));
     let mut k = linear(&xn, &layer.wk, Some(&layer.bk));
     let v = linear(&xn, &layer.wv, Some(&layer.bv));
-    rope(&mut q, nh, hd, config.rope_theta);
-    rope(&mut k, nkv, hd, config.rope_theta);
+    rope(&mut q, nh, hd, config.rope_theta, 0);
+    rope(&mut k, nkv, hd, config.rope_theta, 0);
     let probs = attention_scores(&q, &k, nh, nkv, hd);
     let ctx = attention_apply(&probs, &v, nh, nkv, hd);
     let attn = linear(&ctx, &layer.wo, None);
     let h1 = tensor::add(x, &attn);
 
     // ffn half
+    let hn = tensor::rmsnorm(&h1, &layer.ffn_norm, config.rms_eps);
+    let gate = linear(&hn, &layer.w_gate, None);
+    let up = linear(&hn, &layer.w_up, None);
+    let ffn = linear(&tensor::swiglu(&gate, &up), &layer.w_down, None);
+    tensor::add(&h1, &ffn)
+}
+
+/// Per-layer K/V storage for autoregressive decoding. K rows are stored
+/// post-RoPE (a position's rotation never changes); V rows as-is. Buffers
+/// are pre-allocated to max_ctx positions; len counts positions filled and
+/// advances once per forward pass, after every layer has appended.
+pub struct KvCache {
+    k: Vec<Vec<f32>>, // [n_layers][max_ctx * kv_dim]
+    v: Vec<Vec<f32>>,
+    pub len: usize,
+    pub max_ctx: usize,
+    kv_dim: usize,
+}
+
+impl KvCache {
+    pub fn new(config: &Config, max_ctx: usize) -> KvCache {
+        let kv_dim = config.n_kv_heads * config.head_dim;
+        KvCache {
+            k: vec![vec![0.0; max_ctx * kv_dim]; config.n_layers],
+            v: vec![vec![0.0; max_ctx * kv_dim]; config.n_layers],
+            len: 0,
+            max_ctx,
+            kv_dim,
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        2 * self.k.len() * self.max_ctx * self.kv_dim * 4
+    }
+
+    /// Write new K/V rows for one layer at positions start_pos..start_pos+n.
+    fn append(&mut self, layer_idx: usize, start_pos: usize, k_rows: &[f32], v_rows: &[f32]) {
+        let n = k_rows.len() / self.kv_dim;
+        assert!(
+            start_pos + n <= self.max_ctx,
+            "kv cache overflow: {} + {} > max_ctx {}",
+            start_pos, n, self.max_ctx
+        );
+        let at = start_pos * self.kv_dim;
+        self.k[layer_idx][at..at + k_rows.len()].copy_from_slice(k_rows);
+        self.v[layer_idx][at..at + v_rows.len()].copy_from_slice(v_rows);
+    }
+
+    /// Cached K and V for one layer, valid through position `total`.
+    fn layer(&self, layer_idx: usize, total: usize) -> (&[f32], &[f32]) {
+        let end = total * self.kv_dim;
+        (&self.k[layer_idx][..end], &self.v[layer_idx][..end])
+    }
+}
+
+/// Attention probabilities for new queries against the cached K range.
+/// q [n_new, n_heads*head_dim] at absolute positions start_pos..start_pos+
+/// n_new; k_cache holds `total` rows of kv_dim. -> [n_heads, n_new, total].
+/// Query s attends to t <= start_pos + s; in decode (n_new = 1) every cached
+/// position satisfies this -- the cache holds only the past, so attending to
+/// all of it is causal by construction.
+fn attention_scores_cached(
+    q: &Tensor,
+    k_cache: &[f32],
+    total: usize,
+    start_pos: usize,
+    config: &Config,
+) -> Tensor {
+    let (nh, nkv, hd) = (config.n_heads, config.n_kv_heads, config.head_dim);
+    let n_new = q.shape[0];
+    let kv_dim = nkv * hd;
+    assert_eq!(q.shape[1], nh * hd, "attention: bad q width {:?}", q.shape);
+    assert_eq!(k_cache.len(), total * kv_dim, "attention: bad k_cache length");
+    let group = nh / nkv;
+    let scale = 1.0 / (hd as f32).sqrt();
+
+    let mut probs = Tensor::zeros(vec![nh, n_new, total]);
+    for h in 0..nh {
+        let kv = h / group;
+        for s in 0..n_new {
+            let q_head = &q.data[s * q.shape[1] + h * hd..][..hd];
+            let row = &mut probs.data[(h * n_new + s) * total..][..total];
+            for t in 0..total {
+                row[t] = if t <= start_pos + s {
+                    let k_head = &k_cache[t * kv_dim + kv * hd..][..hd];
+                    let dot: f32 = q_head.iter().zip(k_head).map(|(a, b)| a * b).sum();
+                    dot * scale
+                } else {
+                    f32::NEG_INFINITY
+                };
+            }
+        }
+    }
+    tensor::softmax(&mut probs);
+    probs
+}
+
+/// probs [n_heads, n_new, total] x cached V -> [n_new, n_heads*head_dim].
+fn attention_apply_cached(
+    probs: &Tensor,
+    v_cache: &[f32],
+    config: &Config,
+) -> Tensor {
+    let (nh, nkv, hd) = (config.n_heads, config.n_kv_heads, config.head_dim);
+    let (n_new, total) = (probs.shape[1], probs.shape[2]);
+    let kv_dim = nkv * hd;
+    assert_eq!(v_cache.len(), total * kv_dim, "attention: bad v_cache length");
+    let group = nh / nkv;
+
+    let mut out = Tensor::zeros(vec![n_new, nh * hd]);
+    for h in 0..nh {
+        let kv = h / group;
+        for s in 0..n_new {
+            let row = &probs.data[(h * n_new + s) * total..][..total];
+            let out_head = &mut out.data[s * nh * hd + h * hd..][..hd];
+            for t in 0..total {
+                let p = row[t];
+                let v_head = &v_cache[t * kv_dim + kv * hd..][..hd];
+                for d in 0..hd {
+                    out_head[d] += p * v_head[d];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One block over NEW tokens only, reading/writing the KV cache.
+/// x [n_new, hidden] are the hidden states of tokens at absolute positions
+/// start_pos..start_pos+n_new. Prefill is n_new = prompt length with an
+/// empty cache; decode is n_new = 1.
+pub fn layer_forward_cached(
+    x: &Tensor,
+    layer: &Layer,
+    config: &Config,
+    cache: &mut KvCache,
+    layer_idx: usize,
+    start_pos: usize,
+) -> Tensor {
+    let (nh, nkv, hd) = (config.n_heads, config.n_kv_heads, config.head_dim);
+    let n_new = x.shape[0];
+
+    // attention half
+    let xn = tensor::rmsnorm(x, &layer.attn_norm, config.rms_eps);
+    let mut q = linear(&xn, &layer.wq, Some(&layer.bq));
+    let mut k = linear(&xn, &layer.wk, Some(&layer.bk));
+    let v = linear(&xn, &layer.wv, Some(&layer.bv));
+    rope(&mut q, nh, hd, config.rope_theta, start_pos);
+    rope(&mut k, nkv, hd, config.rope_theta, start_pos);
+
+    cache.append(layer_idx, start_pos, &k.data, &v.data);
+    let total = start_pos + n_new;
+    let (k_cache, v_cache) = cache.layer(layer_idx, total);
+    let probs = attention_scores_cached(&q, k_cache, total, start_pos, config);
+    let ctx = attention_apply_cached(&probs, v_cache, config);
+
+    let attn = linear(&ctx, &layer.wo, None);
+    let h1 = tensor::add(x, &attn);
+
+    // ffn half (identical to the uncached path)
     let hn = tensor::rmsnorm(&h1, &layer.ffn_norm, config.rms_eps);
     let gate = linear(&hn, &layer.w_gate, None);
     let up = linear(&hn, &layer.w_up, None);
@@ -312,12 +475,34 @@ impl Model {
     /// Run the full network and return logits for the LAST position only:
     /// [1, vocab]. Greedy decoding never needs the other rows, and the
     /// lm_head matmul is the single most expensive op in the model.
+    /// Uncached reference path: recomputes everything, every call.
     pub fn forward_last(&self, tokens: &[u32]) -> Tensor {
         let mut x = embed(&self.embedding, tokens);
         for layer in &self.layers {
             x = layer_forward(&x, layer, &self.config);
         }
-        let xn = tensor::rmsnorm(&x, &self.output_norm, self.config.rms_eps);
+        self.last_row_logits(&x)
+    }
+
+    /// Cached forward over NEW tokens only. Pass the whole prompt for
+    /// prefill, then one token per decode step. Advances cache.len.
+    pub fn forward_cached(&self, tokens: &[u32], cache: &mut KvCache) -> Tensor {
+        let start = cache.len;
+        assert!(
+            start + tokens.len() <= cache.max_ctx,
+            "context overflow: {} + {} > max_ctx {}",
+            start, tokens.len(), cache.max_ctx
+        );
+        let mut x = embed(&self.embedding, tokens);
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer_forward_cached(&x, layer, &self.config, cache, i, start);
+        }
+        cache.len += tokens.len();
+        self.last_row_logits(&x)
+    }
+
+    fn last_row_logits(&self, x: &Tensor) -> Tensor {
+        let xn = tensor::rmsnorm(x, &self.output_norm, self.config.rms_eps);
         let hidden = self.config.hidden;
         let last_row = xn.data[(xn.shape[0] - 1) * hidden..].to_vec();
         let last = Tensor::from_vec(last_row, vec![1, hidden]);
@@ -340,7 +525,7 @@ mod tests {
     fn rope_position_zero_is_identity() {
         // row 0 is position 0: all angles are 0, rotation is identity
         let mut x = Tensor::from_vec(vec![1., 2., 3., 4.], vec![1, 4]);
-        rope(&mut x, 1, 4, 1e6);
+        rope(&mut x, 1, 4, 1e6, 0);
         assert_eq!(x.data, vec![1., 2., 3., 4.]);
     }
 
@@ -353,7 +538,7 @@ mod tests {
         //   x2' = 1*sin1 + 3*cos1 = 0.8414710 + 1.6209068 =  2.4623778
         //   x3' = 2*sin.5 + 4*cos.5 = 0.9588511 + 3.5103304 = 4.4691815
         let mut x = Tensor::from_vec(vec![9., 9., 9., 9., 1., 2., 3., 4.], vec![2, 4]);
-        rope(&mut x, 1, 4, 4.0);
+        rope(&mut x, 1, 4, 4.0, 0);
         assert_close(
             &x.data[4..],
             &[-1.9841108, -0.1625368, 2.4623778, 4.4691815],
@@ -377,6 +562,79 @@ mod tests {
         for row in probs.data.chunks_exact(3) {
             let sum: f32 = row.iter().sum();
             assert!((sum - 1.0).abs() < 1e-6, "row sums to {}", sum);
+        }
+    }
+
+    /// Deterministic pseudo-random values, same every run.
+    fn fill(n: usize, salt: f32) -> Vec<f32> {
+        (0..n).map(|i| ((i as f32 * 0.37 + salt).sin()) * 0.5).collect()
+    }
+
+    fn tiny_config() -> Config {
+        Config {
+            n_layers: 1,
+            n_heads: 2,
+            n_kv_heads: 1,
+            hidden: 8,
+            ffn: 16,
+            head_dim: 4,
+            rope_theta: 100.0,
+            rms_eps: 1e-6,
+            vocab: 1,
+            context_length: 32,
+        }
+    }
+
+    fn tiny_layer(c: &Config) -> Layer {
+        let (h, f, qd, kd) = (c.hidden, c.ffn, c.n_heads * c.head_dim, c.n_kv_heads * c.head_dim);
+        Layer {
+            attn_norm: Tensor::from_vec(fill(h, 1.0), vec![h]),
+            wq: Tensor::from_vec(fill(qd * h, 2.0), vec![qd, h]),
+            bq: Tensor::from_vec(fill(qd, 3.0), vec![qd]),
+            wk: Tensor::from_vec(fill(kd * h, 4.0), vec![kd, h]),
+            bk: Tensor::from_vec(fill(kd, 5.0), vec![kd]),
+            wv: Tensor::from_vec(fill(kd * h, 6.0), vec![kd, h]),
+            bv: Tensor::from_vec(fill(kd, 7.0), vec![kd]),
+            wo: Tensor::from_vec(fill(h * qd, 8.0), vec![h, qd]),
+            ffn_norm: Tensor::from_vec(fill(h, 9.0), vec![h]),
+            w_gate: Tensor::from_vec(fill(f * h, 10.0), vec![f, h]),
+            w_up: Tensor::from_vec(fill(f * h, 11.0), vec![f, h]),
+            w_down: Tensor::from_vec(fill(h * f, 12.0), vec![h, f]),
+        }
+    }
+
+    #[test]
+    fn cached_path_is_bit_identical_to_uncached() {
+        // 3-token prefill + 2 single-token decode steps must equal one
+        // 5-token uncached forward EXACTLY: both paths execute the same
+        // dot products in the same order, so even f32 rounding agrees.
+        let config = tiny_config();
+        let layer = tiny_layer(&config);
+        let x = Tensor::from_vec(fill(5 * config.hidden, 20.0), vec![5, config.hidden]);
+
+        let uncached = layer_forward(&x, &layer, &config);
+
+        let mut cache = KvCache::new(&config, 32);
+        let prefill_in = Tensor::from_vec(x.data[..3 * config.hidden].to_vec(), vec![3, config.hidden]);
+        let prefill_out = layer_forward_cached(&prefill_in, &layer, &config, &mut cache, 0, 0);
+        cache.len = 3;
+        // prefill rows must already match rows 0..3
+        assert_eq!(prefill_out.data, uncached.data[..3 * config.hidden]);
+
+        for s in 3..5 {
+            let row = Tensor::from_vec(
+                x.data[s * config.hidden..(s + 1) * config.hidden].to_vec(),
+                vec![1, config.hidden],
+            );
+            let start = cache.len;
+            let out = layer_forward_cached(&row, &layer, &config, &mut cache, 0, start);
+            cache.len += 1;
+            assert_eq!(
+                out.data,
+                uncached.data[s * config.hidden..(s + 1) * config.hidden],
+                "decode step for position {} diverged from uncached",
+                s
+            );
         }
     }
 

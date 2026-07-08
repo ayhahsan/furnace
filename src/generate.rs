@@ -1,7 +1,8 @@
 // Greedy decoding loop with streaming UTF-8 output.
 
-use crate::model::Model;
+use crate::model::{KvCache, Model};
 use crate::tokenizer::Tokenizer;
+use anyhow::ensure;
 use anyhow::Result;
 use std::io::Write;
 use std::time::Instant;
@@ -74,11 +75,81 @@ pub fn argmax(data: &[f32]) -> u32 {
     best as u32
 }
 
-/// Greedy decoding: forward -> argmax -> append -> repeat, full recompute
-/// every step (the KV cache is M7; per-token timing here is its baseline).
-/// Streams text to stdout, reports ids and timing on stderr, and returns
-/// the generated ids.
+/// Greedy decoding with a KV cache: prefill the prompt once, then decode
+/// one token per step. Streams text to stdout, reports ids and timing on
+/// stderr, and returns the generated ids.
 pub fn generate(
+    model: &Model,
+    tokenizer: &Tokenizer,
+    prompt_ids: Vec<u32>,
+    max_new: usize,
+    stop_ids: &[u32],
+) -> Result<Vec<u32>> {
+    let max_ctx = model.config.context_length.min(4096);
+    ensure!(
+        prompt_ids.len() + max_new <= max_ctx,
+        "prompt ({}) + max tokens ({}) exceeds context cap {}",
+        prompt_ids.len(), max_new, max_ctx
+    );
+    let mut cache = KvCache::new(&model.config, max_ctx);
+    eprintln!(
+        "kv cache: {:.0} MB for {} positions",
+        cache.bytes() as f64 / (1024.0 * 1024.0),
+        max_ctx
+    );
+
+    let mut generated = Vec::new();
+    let mut stream = Utf8Stream::new();
+    let mut stdout = std::io::stdout();
+
+    let t0 = Instant::now();
+    let mut logits = model.forward_cached(&prompt_ids, &mut cache);
+    let prefill = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "prefill: {} tokens in {:.2} s ({:.0} ms/token)",
+        prompt_ids.len(),
+        prefill,
+        prefill * 1000.0 / prompt_ids.len() as f64
+    );
+
+    let mut decode_seconds = 0.0;
+    let mut decode_steps = 0usize;
+    for step in 0..max_new {
+        let next = argmax(&logits.data);
+        if stop_ids.contains(&next) {
+            break;
+        }
+        generated.push(next);
+        print!("{}", stream.push(&tokenizer.token_bytes(next)?));
+        stdout.flush()?;
+        if step + 1 == max_new {
+            break;
+        }
+        let t0 = Instant::now();
+        logits = model.forward_cached(&[next], &mut cache);
+        let dt = t0.elapsed().as_secs_f64();
+        decode_seconds += dt;
+        decode_steps += 1;
+        eprintln!("[decode {:3}: seq {:4}, {:6.0} ms/token]", step, cache.len, dt * 1000.0);
+    }
+    print!("{}", stream.flush());
+    println!();
+    stdout.flush()?;
+
+    if decode_steps > 0 {
+        eprintln!(
+            "decode: {} steps, {:.0} ms/token average (M6 baseline: 27000-35000 ms/token)",
+            decode_steps,
+            decode_seconds * 1000.0 / decode_steps as f64
+        );
+    }
+    eprintln!("generated ids: {:?}", generated);
+    Ok(generated)
+}
+
+/// M6 reference path: full recompute every step, no cache. Kept as the
+/// ground truth the cached path must match byte for byte.
+pub fn generate_uncached(
     model: &Model,
     tokenizer: &Tokenizer,
     prompt_ids: Vec<u32>,

@@ -147,8 +147,8 @@ pub fn run_m5(model_path: &Path, ref_path: &Path) -> Result<()> {
     // stage 4: RoPE (validates the half-split pairing convention)
     let mut q = q;
     let mut k = k;
-    model::rope(&mut q, config.n_heads, config.head_dim, config.rope_theta);
-    model::rope(&mut k, config.n_kv_heads, config.head_dim, config.rope_theta);
+    model::rope(&mut q, config.n_heads, config.head_dim, config.rope_theta, 0);
+    model::rope(&mut k, config.n_kv_heads, config.head_dim, config.rope_theta, 0);
     stage(4, "q_rope", &q, get("q_rope")?, 5e-5)?;
     stage(4, "k_rope", &k, get("k_rope")?, 5e-5)?;
 

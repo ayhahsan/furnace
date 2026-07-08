@@ -33,6 +33,10 @@ enum Command {
         /// Feed the prompt as-is instead of wrapping it in the chat template
         #[arg(long)]
         raw: bool,
+        /// Use the M6 full-recompute path instead of the KV cache
+        /// (reference implementation; slow)
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Parse a GGUF file and dump its metadata and tensor table
     Inspect {
@@ -177,7 +181,7 @@ fn main() -> Result<()> {
         Command::SelftestM6 { model, file } => {
             selftest::run_m6(&model, &file)?;
         }
-        Command::Run { model, prompt, max_tokens, raw } => {
+        Command::Run { model, prompt, max_tokens, raw, no_cache } => {
             let t0 = std::time::Instant::now();
             let file = gguf::GgufFile::open(&model)?;
             let tok = tokenizer::Tokenizer::from_gguf(&file)?;
@@ -198,7 +202,11 @@ fn main() -> Result<()> {
                 file.meta_u32("tokenizer.ggml.eos_token_id")?,
                 file.meta_u32("tokenizer.ggml.bos_token_id")?,
             ];
-            generate::generate(&m, &tok, ids, max_tokens, &stop_ids)?;
+            if no_cache {
+                generate::generate_uncached(&m, &tok, ids, max_tokens, &stop_ids)?;
+            } else {
+                generate::generate(&m, &tok, ids, max_tokens, &stop_ids)?;
+            }
         }
     }
     Ok(())
