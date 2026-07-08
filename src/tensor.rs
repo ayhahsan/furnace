@@ -87,14 +87,31 @@ pub fn matmul(a: &Tensor, w: &Tensor) -> Tensor {
         let a_row = &a.data[s * d_in..(s + 1) * d_in];
         for o in 0..d_out {
             let w_row = &w.data[o * d_in..(o + 1) * d_in];
-            let mut sum = 0.0;
-            for i in 0..d_in {
-                sum += a_row[i] * w_row[i];
-            }
-            out.data[s * d_out + o] = sum;
+            out.data[s * d_out + o] = dot(a_row, w_row);
         }
     }
     out
+}
+
+/// Dot product with 8 independent accumulator lanes. A single-accumulator
+/// loop is a serial float dependency chain the compiler must not reorder
+/// (float adds are not associative), so it can neither pipeline nor
+/// vectorize; independent lanes remove the chain at the cost of a different
+/// (grouped) summation order.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let mut ca = a.chunks_exact(8);
+    let mut cb = b.chunks_exact(8);
+    for (x, y) in (&mut ca).zip(&mut cb) {
+        for j in 0..8 {
+            acc[j] += x[j] * y[j];
+        }
+    }
+    let mut sum = acc.iter().sum::<f32>();
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        sum += x * y;
+    }
+    sum
 }
 
 /// Row-wise RMS normalization: y = x / sqrt(mean(x^2) + eps) * weight.
