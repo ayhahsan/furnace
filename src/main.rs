@@ -59,6 +59,10 @@ enum Command {
         /// Print a per-op time breakdown of the decode phase
         #[arg(long)]
         timings: bool,
+        /// Dequantize all weights to f32 at load (reference path; slower
+        /// and ~4x the memory of the default fused quantized kernels)
+        #[arg(long)]
+        f32: bool,
     },
     /// Parse a GGUF file and dump its metadata and tensor table
     Inspect {
@@ -215,17 +219,18 @@ fn main() -> Result<()> {
         Command::SelftestM6 { model, file } => {
             selftest::run_m6(&model, &file)?;
         }
-        Command::Run { model, prompt, max_tokens, raw, no_cache, temp, top_k, top_p, repeat_penalty, seed, timings } => {
+        Command::Run { model, prompt, max_tokens, raw, no_cache, temp, top_k, top_p, repeat_penalty, seed, timings, f32 } => {
             if timings {
                 perf::enable();
             }
             let t0 = std::time::Instant::now();
             let file = gguf::GgufFile::open(&model)?;
             let tok = tokenizer::Tokenizer::from_gguf(&file)?;
-            let m = model::Model::load(&file)?;
+            let m = model::Model::load(&file, f32)?;
             eprintln!(
-                "loaded {:.0} MB of f32 weights in {:.1} s (dequantized up front; M10 moves this on the fly)",
+                "weights: {:.0} MB resident ({}) loaded in {:.2} s",
                 m.param_bytes() as f64 / (1024.0 * 1024.0),
+                if f32 { "dequantized f32 reference path" } else { "quantized, zero-copy from mmap" },
                 t0.elapsed().as_secs_f64()
             );
 

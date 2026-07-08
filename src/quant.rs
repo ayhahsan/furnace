@@ -41,6 +41,37 @@ pub fn dequantize_q8_0(raw: &[u8], n_elements: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Fused Q8_0 matmul: activations [seq, in] x quantized weight rows
+/// [out, in] -> [seq, out]. Dequantization happens inside the dot product;
+/// no f32 weight row is ever materialized. Accumulation is f32 within a
+/// 32-element block (8 independent lanes), then f32 across blocks after
+/// scaling -- the same products as dequantize-then-dot, grouped by block.
+pub fn matmul_q8_0(a: &crate::tensor::Tensor, raw: &[u8], d_out: usize, d_in: usize) -> crate::tensor::Tensor {
+    assert_eq!(d_in % QK8_0, 0, "Q8_0 matmul: in dim {} not a multiple of {}", d_in, QK8_0);
+    let row_bytes = d_in / QK8_0 * Q8_0_BLOCK_BYTES;
+    assert_eq!(raw.len(), d_out * row_bytes, "Q8_0 matmul: bad weight byte count");
+
+    crate::tensor::matmul_with(a, d_out, d_in, |o, a_row| {
+        let row = &raw[o * row_bytes..(o + 1) * row_bytes];
+        let mut acc = 0.0f32;
+        for (b, block) in row.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
+            let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            // fixed-size array refs give LLVM compile-time bounds so the
+            // whole 32-element block body unrolls and vectorizes
+            let qs: &[u8; QK8_0] = block[2..].try_into().unwrap();
+            let a_block: &[f32; QK8_0] = a_row[b * QK8_0..(b + 1) * QK8_0].try_into().unwrap();
+            let mut lanes = [0.0f32; 8];
+            for j in 0..QK8_0 / 8 {
+                for l in 0..8 {
+                    lanes[l] += a_block[j * 8 + l] * (qs[j * 8 + l] as i8) as f32;
+                }
+            }
+            acc += scale * lanes.iter().sum::<f32>();
+        }
+        acc
+    })
+}
+
 /// Decode any supported tensor dtype to f32.
 pub fn dequantize(dtype: GgmlType, raw: &[u8], n_elements: usize) -> Result<Vec<f32>> {
     match dtype {
@@ -106,6 +137,35 @@ mod tests {
         assert!(dequantize_q8_0(&raw[..33], 32).is_err()); // truncated block
         assert!(dequantize_q8_0(&raw, 64).is_err()); // count/bytes mismatch
         assert!(dequantize_q8_0(&raw, 31).is_err()); // not a multiple of 32
+    }
+
+    #[test]
+    fn fused_q8_matmul_matches_dequant_reference() {
+        // weight: 3 output rows x 64 inputs = 2 blocks per row, varied
+        // scales and signed quants; the fused kernel must agree with
+        // dequantize-then-f32-matmul to f32 rounding
+        let mut raw = Vec::new();
+        for o in 0..3i32 {
+            for b in 0..2i32 {
+                let quants: [i8; 32] =
+                    std::array::from_fn(|j| ((j as i32 * 7 + o * 13 + b * 5) % 255 - 127) as i8);
+                raw.extend(block(0.5 + o as f32 * 0.25, quants));
+            }
+        }
+        let x = crate::tensor::Tensor::from_vec(
+            (0..2 * 64).map(|i| ((i as f32) * 0.31).sin()).collect(),
+            vec![2, 64],
+        );
+
+        let weights_f32 = dequantize_q8_0(&raw, 3 * 64).unwrap();
+        let w = crate::tensor::Tensor::from_vec(weights_f32, vec![3, 64]);
+        let reference = crate::tensor::matmul(&x, &w);
+        let fused = matmul_q8_0(&x, &raw, 3, 64);
+
+        assert_eq!(fused.shape, reference.shape);
+        for (f, r) in fused.data.iter().zip(&reference.data) {
+            assert!((f - r).abs() < 1e-4, "fused {} vs reference {}", f, r);
+        }
     }
 
     #[test]

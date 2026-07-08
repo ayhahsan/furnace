@@ -72,14 +72,29 @@ impl Tensor {
 
 /// [seq, in] x [out, in] -> [seq, out]. See module header for the convention.
 pub fn matmul(a: &Tensor, w: &Tensor) -> Tensor {
-    assert_eq!(a.shape.len(), 2, "matmul: activation must be 2-D, got {:?}", a.shape);
     assert_eq!(w.shape.len(), 2, "matmul: weight must be 2-D, got {:?}", w.shape);
-    let (seq, d_in) = (a.shape[0], a.shape[1]);
-    let (d_out, w_in) = (w.shape[0], w.shape[1]);
+    let (d_out, d_in) = (w.shape[0], w.shape[1]);
+    matmul_with(a, d_out, d_in, |o, a_row| {
+        dot(a_row, &w.data[o * d_in..(o + 1) * d_in])
+    })
+}
+
+/// Shared matmul skeleton: parallelism and loop order from M9, generic over
+/// how output element o is computed from an activation row (f32 dot for
+/// dequantized weights, fused block dot for quantized ones).
+/// row_dot(o, a_row) must read weight row o exactly once.
+pub fn matmul_with(
+    a: &Tensor,
+    d_out: usize,
+    d_in: usize,
+    row_dot: impl Fn(usize, &[f32]) -> f32 + Sync,
+) -> Tensor {
+    assert_eq!(a.shape.len(), 2, "matmul: activation must be 2-D, got {:?}", a.shape);
+    let seq = a.shape[0];
     assert_eq!(
-        d_in, w_in,
-        "matmul: inner dims differ: activation {:?} vs weight {:?} (weight must be [out, in])",
-        a.shape, w.shape
+        a.shape[1], d_in,
+        "matmul: inner dims differ: activation {:?} vs weight [{}, {}]",
+        a.shape, d_out, d_in
     );
     let _t = crate::perf::time(&crate::perf::MATMUL);
 
@@ -93,8 +108,7 @@ pub fn matmul(a: &Tensor, w: &Tensor) -> Tensor {
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
                 for (j, dst) in chunk.iter_mut().enumerate() {
-                    let o = chunk_idx * 64 + j;
-                    *dst = dot(a_row, &w.data[o * d_in..(o + 1) * d_in]);
+                    *dst = row_dot(chunk_idx * 64 + j, a_row);
                 }
             });
     } else {
@@ -108,9 +122,8 @@ pub fn matmul(a: &Tensor, w: &Tensor) -> Tensor {
             .for_each(|(chunk_idx, chunk)| {
                 let o0 = chunk_idx * 64;
                 for (j, o_col) in chunk.chunks_exact_mut(seq).enumerate() {
-                    let w_row = &w.data[(o0 + j) * d_in..(o0 + j + 1) * d_in];
                     for (s, dst) in o_col.iter_mut().enumerate() {
-                        *dst = dot(&a.data[s * d_in..(s + 1) * d_in], w_row);
+                        *dst = row_dot(o0 + j, &a.data[s * d_in..(s + 1) * d_in]);
                     }
                 }
             });

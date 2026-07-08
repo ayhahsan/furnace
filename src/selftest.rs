@@ -112,8 +112,8 @@ pub fn run_m5(model_path: &Path, ref_path: &Path) -> Result<()> {
 
     let file = GgufFile::open(model_path)?;
     let config = Config::from_gguf(&file)?;
-    let layer = Layer::load(&file, 0)?;
-    let embedding = Tensor::from_gguf(&file, "token_embd.weight")?;
+    let layer = Layer::load(&file, 0, false)?;
+    let embedding = model::load_weight(&file, "token_embd.weight", false)?;
     println!("config: {:?}", config);
     println!("tokens: {:?}", tokens);
 
@@ -196,7 +196,7 @@ pub fn run_m6(model_path: &Path, ref_path: &Path) -> Result<()> {
 
     let file = GgufFile::open(model_path)?;
     let t0 = std::time::Instant::now();
-    let m = Model::load(&file)?;
+    let m = Model::load(&file, false)?;
     println!(
         "loaded {:.0} MB of f32 weights in {:.1} s",
         m.param_bytes() as f64 / (1024.0 * 1024.0),

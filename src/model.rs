@@ -19,7 +19,7 @@
 //   silu(gate) * up -> @ Wd^T                              ffn   [5, 896]
 //   h1 + ffn                                               out   [5, 896]
 
-use crate::gguf::GgufFile;
+use crate::gguf::{GgmlType, GgufFile};
 use crate::tensor::{self, Tensor};
 use anyhow::{ensure, Result};
 
@@ -60,46 +60,114 @@ impl Config {
     }
 }
 
-/// One transformer block's weights, dequantized to f32.
-pub struct Layer {
-    pub attn_norm: Tensor, // [hidden]
-    pub wq: Tensor,        // [n_heads*head_dim, hidden]
-    pub bq: Tensor,        // [n_heads*head_dim]
-    pub wk: Tensor,        // [n_kv_heads*head_dim, hidden]
-    pub bk: Tensor,
-    pub wv: Tensor,
-    pub bv: Tensor,
-    pub wo: Tensor,        // [hidden, n_heads*head_dim], no bias
-    pub ffn_norm: Tensor,  // [hidden]
-    pub w_gate: Tensor,    // [ffn, hidden]
-    pub w_up: Tensor,      // [ffn, hidden]
-    pub w_down: Tensor,    // [hidden, ffn]
+/// A matmul weight: either owned dequantized f32 (reference path, and any
+/// dtype without a fused kernel) or raw quantized bytes borrowed straight
+/// from the mmap (zero-copy: resident memory is the mapped file pages).
+pub enum Weight<'a> {
+    F32(Tensor),
+    Quant {
+        raw: &'a [u8],
+        dtype: GgmlType,
+        out: usize,
+        inn: usize,
+    },
 }
 
-impl Layer {
-    pub fn load(file: &GgufFile, idx: usize) -> Result<Layer> {
+impl<'a> Weight<'a> {
+    pub fn out_dim(&self) -> usize {
+        match self {
+            Weight::F32(t) => t.shape[0],
+            Weight::Quant { out, .. } => *out,
+        }
+    }
+
+    pub fn in_dim(&self) -> usize {
+        match self {
+            Weight::F32(t) => t.shape[1],
+            Weight::Quant { inn, .. } => *inn,
+        }
+    }
+
+    /// Bytes this weight keeps resident (f32 storage or quantized bytes).
+    pub fn bytes(&self) -> usize {
+        match self {
+            Weight::F32(t) => t.numel() * 4,
+            Weight::Quant { raw, .. } => raw.len(),
+        }
+    }
+
+    pub fn matmul(&self, x: &Tensor) -> Tensor {
+        match self {
+            Weight::F32(t) => tensor::matmul(x, t),
+            Weight::Quant { raw, dtype, out, inn } => match dtype {
+                GgmlType::Q8_0 => crate::quant::matmul_q8_0(x, raw, *out, *inn),
+                other => panic!("no fused matmul kernel for {:?}", other),
+            },
+        }
+    }
+}
+
+/// Load a 2-D weight: quantized dtypes with a fused kernel stay as borrowed
+/// bytes; everything else (including F32 tensors and dtypes we can only
+/// dequantize) becomes owned f32. use_f32 forces the dequantized path.
+pub fn load_weight<'a>(file: &'a GgufFile, name: &str, use_f32: bool) -> Result<Weight<'a>> {
+    let (info, raw) = file.tensor(name)?;
+    let has_fused_kernel = matches!(info.dtype, GgmlType::Q8_0);
+    if use_f32 || !has_fused_kernel {
+        return Ok(Weight::F32(Tensor::from_gguf(file, name)?));
+    }
+    ensure!(info.dims.len() == 2, "weight '{}' is not 2-D: {:?}", name, info.dims);
+    Ok(Weight::Quant {
+        raw,
+        dtype: info.dtype,
+        out: info.dims[1] as usize,
+        inn: info.dims[0] as usize,
+    })
+}
+
+/// One transformer block's weights. Matmul weights may be quantized; norms
+/// and biases are always small owned f32 tensors.
+pub struct Layer<'a> {
+    pub attn_norm: Tensor, // [hidden]
+    pub wq: Weight<'a>,    // [n_heads*head_dim, hidden]
+    pub bq: Tensor,        // [n_heads*head_dim]
+    pub wk: Weight<'a>,    // [n_kv_heads*head_dim, hidden]
+    pub bk: Tensor,
+    pub wv: Weight<'a>,
+    pub bv: Tensor,
+    pub wo: Weight<'a>,    // [hidden, n_heads*head_dim], no bias
+    pub ffn_norm: Tensor,  // [hidden]
+    pub w_gate: Weight<'a>, // [ffn, hidden]
+    pub w_up: Weight<'a>,   // [ffn, hidden]
+    pub w_down: Weight<'a>, // [hidden, ffn]
+}
+
+impl<'a> Layer<'a> {
+    pub fn load(file: &'a GgufFile, idx: usize, use_f32: bool) -> Result<Layer<'a>> {
         let t = |suffix: &str| Tensor::from_gguf(file, &format!("blk.{}.{}", idx, suffix));
+        let w = |suffix: &str| load_weight(file, &format!("blk.{}.{}", idx, suffix), use_f32);
         Ok(Layer {
             attn_norm: t("attn_norm.weight")?,
-            wq: t("attn_q.weight")?,
+            wq: w("attn_q.weight")?,
             bq: t("attn_q.bias")?,
-            wk: t("attn_k.weight")?,
+            wk: w("attn_k.weight")?,
             bk: t("attn_k.bias")?,
-            wv: t("attn_v.weight")?,
+            wv: w("attn_v.weight")?,
             bv: t("attn_v.bias")?,
-            wo: t("attn_output.weight")?,
+            wo: w("attn_output.weight")?,
             ffn_norm: t("ffn_norm.weight")?,
-            w_gate: t("ffn_gate.weight")?,
-            w_up: t("ffn_up.weight")?,
-            w_down: t("ffn_down.weight")?,
+            w_gate: w("ffn_gate.weight")?,
+            w_up: w("ffn_up.weight")?,
+            w_down: w("ffn_down.weight")?,
         })
     }
 }
 
 /// x [seq, in] @ w [out, in] -> [seq, out], plus optional bias [out]
-/// broadcast over rows.
-pub fn linear(x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Tensor {
-    let mut out = tensor::matmul(x, w);
+/// broadcast over rows. Dispatches on the weight storage (f32 or fused
+/// quantized kernel).
+pub fn linear(x: &Tensor, w: &Weight, bias: Option<&Tensor>) -> Tensor {
+    let mut out = w.matmul(x);
     if let Some(b) = bias {
         let cols = out.shape[1];
         assert_eq!(
@@ -409,72 +477,89 @@ pub fn layer_forward_cached(
     tensor::add(&h1, &ffn)
 }
 
-/// Token embedding lookup: copy row t of token_embd for each token.
-pub fn embed(embedding: &Tensor, tokens: &[u32]) -> Tensor {
+/// Token embedding lookup. For quantized embeddings only the touched rows
+/// are dequantized (a row is a whole number of blocks, so it slices clean).
+pub fn embed(embedding: &Weight, tokens: &[u32]) -> Tensor {
     let _t = crate::perf::time(&crate::perf::EMBED);
-    let hidden = embedding.shape[1];
-    let vocab = embedding.shape[0];
+    let hidden = embedding.in_dim();
+    let vocab = embedding.out_dim();
     let mut out = Tensor::zeros(vec![tokens.len(), hidden]);
     for (s, &tok) in tokens.iter().enumerate() {
         let t = tok as usize;
         assert!(t < vocab, "token id {} out of range (vocab {})", t, vocab);
-        out.data[s * hidden..(s + 1) * hidden]
-            .copy_from_slice(&embedding.data[t * hidden..(t + 1) * hidden]);
+        let dst = &mut out.data[s * hidden..(s + 1) * hidden];
+        match embedding {
+            Weight::F32(e) => dst.copy_from_slice(&e.data[t * hidden..(t + 1) * hidden]),
+            Weight::Quant { raw, dtype, .. } => {
+                let (block_elems, block_bytes) = dtype
+                    .block_layout()
+                    .expect("quant weight with unknown block layout");
+                let row_bytes = hidden / block_elems * block_bytes;
+                let row = &raw[t * row_bytes..(t + 1) * row_bytes];
+                let values = crate::quant::dequantize(*dtype, row, hidden)
+                    .expect("embedding row dequantization failed");
+                dst.copy_from_slice(&values);
+            }
+        }
     }
     out
 }
 
 /// The whole network: embedding, all blocks, final norm, lm_head.
-/// Everything is dequantized to f32 up front (~2.4 GB for 0.5B; M10 will
-/// dequantize on the fly instead).
-pub struct Model {
+/// Weights stay quantized (borrowed from the mmap) unless use_f32 asks for
+/// the dequantize-everything reference path.
+pub struct Model<'a> {
     pub config: Config,
-    pub embedding: Tensor,   // [vocab, hidden]
-    pub layers: Vec<Layer>,
-    pub output_norm: Tensor, // [hidden]
-    pub lm_head: Tensor,     // [vocab, hidden]; GGUF stores it even though
-                             // Qwen2.5-0.5B ties it to the embedding
+    pub embedding: Weight<'a>, // [vocab, hidden]
+    pub layers: Vec<Layer<'a>>,
+    pub output_norm: Tensor,   // [hidden]
+    pub lm_head: Weight<'a>,   // [vocab, hidden]
 }
 
-impl Model {
-    pub fn load(file: &GgufFile) -> Result<Model> {
+impl<'a> Model<'a> {
+    pub fn load(file: &'a GgufFile, use_f32: bool) -> Result<Model<'a>> {
         let config = Config::from_gguf(file)?;
-        let embedding = Tensor::from_gguf(file, "token_embd.weight")?;
+        let embedding = load_weight(file, "token_embd.weight", use_f32)?;
         ensure!(
-            embedding.shape == vec![config.vocab, config.hidden],
-            "token_embd shape {:?} does not match config", embedding.shape
+            embedding.out_dim() == config.vocab && embedding.in_dim() == config.hidden,
+            "token_embd is [{}, {}], config says [{}, {}]",
+            embedding.out_dim(), embedding.in_dim(), config.vocab, config.hidden
         );
         let layers = (0..config.n_layers)
-            .map(|i| Layer::load(file, i))
+            .map(|i| Layer::load(file, i, use_f32))
             .collect::<Result<Vec<_>>>()?;
         for (i, l) in layers.iter().enumerate() {
             ensure!(
-                l.w_gate.shape == vec![config.ffn, config.hidden],
-                "blk.{} ffn_gate shape {:?}, expected [{}, {}]",
-                i, l.w_gate.shape, config.ffn, config.hidden
+                l.w_gate.out_dim() == config.ffn && l.w_gate.in_dim() == config.hidden,
+                "blk.{} ffn_gate is [{}, {}], expected [{}, {}]",
+                i, l.w_gate.out_dim(), l.w_gate.in_dim(), config.ffn, config.hidden
             );
         }
         let output_norm = Tensor::from_gguf(file, "output_norm.weight")?;
-        let lm_head = Tensor::from_gguf(file, "output.weight")?;
+        // tied-embedding models (e.g. Qwen2.5-1.5B) omit output.weight from
+        // the GGUF; the lm_head is then the embedding matrix itself
+        let lm_head = if file.tensors.iter().any(|t| t.name == "output.weight") {
+            load_weight(file, "output.weight", use_f32)?
+        } else {
+            load_weight(file, "token_embd.weight", use_f32)?
+        };
         ensure!(
-            lm_head.shape == vec![config.vocab, config.hidden],
-            "output.weight shape {:?} does not match config", lm_head.shape
+            lm_head.out_dim() == config.vocab && lm_head.in_dim() == config.hidden,
+            "lm_head is [{}, {}], config says [{}, {}]",
+            lm_head.out_dim(), lm_head.in_dim(), config.vocab, config.hidden
         );
         Ok(Model { config, embedding, layers, output_norm, lm_head })
     }
 
-    /// Total f32 bytes held by the dequantized weights.
+    /// Bytes the weights keep resident (quantized bytes or f32 storage).
     pub fn param_bytes(&self) -> usize {
-        let layer_elems: usize = self.layers.iter().map(|l| {
-            [
-                &l.attn_norm, &l.wq, &l.bq, &l.wk, &l.bk, &l.wv, &l.bv, &l.wo,
-                &l.ffn_norm, &l.w_gate, &l.w_up, &l.w_down,
-            ]
-            .iter()
-            .map(|t| t.numel())
-            .sum::<usize>()
+        let layer_bytes: usize = self.layers.iter().map(|l| {
+            l.wq.bytes() + l.wk.bytes() + l.wv.bytes() + l.wo.bytes()
+                + l.w_gate.bytes() + l.w_up.bytes() + l.w_down.bytes()
+                + (l.attn_norm.numel() + l.bq.numel() + l.bk.numel()
+                    + l.bv.numel() + l.ffn_norm.numel()) * 4
         }).sum();
-        (layer_elems + self.embedding.numel() + self.output_norm.numel() + self.lm_head.numel()) * 4
+        layer_bytes + self.embedding.bytes() + self.output_norm.numel() * 4 + self.lm_head.bytes()
     }
 
     /// Run the full network and return logits for the LAST position only:
@@ -590,21 +675,21 @@ mod tests {
         }
     }
 
-    fn tiny_layer(c: &Config) -> Layer {
+    fn tiny_layer(c: &Config) -> Layer<'static> {
         let (h, f, qd, kd) = (c.hidden, c.ffn, c.n_heads * c.head_dim, c.n_kv_heads * c.head_dim);
         Layer {
             attn_norm: Tensor::from_vec(fill(h, 1.0), vec![h]),
-            wq: Tensor::from_vec(fill(qd * h, 2.0), vec![qd, h]),
+            wq: Weight::F32(Tensor::from_vec(fill(qd * h, 2.0), vec![qd, h])),
             bq: Tensor::from_vec(fill(qd, 3.0), vec![qd]),
-            wk: Tensor::from_vec(fill(kd * h, 4.0), vec![kd, h]),
+            wk: Weight::F32(Tensor::from_vec(fill(kd * h, 4.0), vec![kd, h])),
             bk: Tensor::from_vec(fill(kd, 5.0), vec![kd]),
-            wv: Tensor::from_vec(fill(kd * h, 6.0), vec![kd, h]),
+            wv: Weight::F32(Tensor::from_vec(fill(kd * h, 6.0), vec![kd, h])),
             bv: Tensor::from_vec(fill(kd, 7.0), vec![kd]),
-            wo: Tensor::from_vec(fill(h * qd, 8.0), vec![h, qd]),
+            wo: Weight::F32(Tensor::from_vec(fill(h * qd, 8.0), vec![h, qd])),
             ffn_norm: Tensor::from_vec(fill(h, 9.0), vec![h]),
-            w_gate: Tensor::from_vec(fill(f * h, 10.0), vec![f, h]),
-            w_up: Tensor::from_vec(fill(f * h, 11.0), vec![f, h]),
-            w_down: Tensor::from_vec(fill(h * f, 12.0), vec![h, f]),
+            w_gate: Weight::F32(Tensor::from_vec(fill(f * h, 10.0), vec![f, h])),
+            w_up: Weight::F32(Tensor::from_vec(fill(f * h, 11.0), vec![f, h])),
+            w_down: Weight::F32(Tensor::from_vec(fill(h * f, 12.0), vec![h, f])),
         }
     }
 
