@@ -101,7 +101,7 @@ impl<'a> Weight<'a> {
             Weight::F32(t) => tensor::matmul(x, t),
             Weight::Quant { raw, dtype, out, inn } => match dtype {
                 GgmlType::Q8_0 => crate::quant::matmul_q8_0(x, raw, *out, *inn),
-                other => panic!("no fused matmul kernel for {:?}", other),
+                other => crate::quant::matmul_blocks(x, raw, *out, *inn, *other),
             },
         }
     }
@@ -112,7 +112,8 @@ impl<'a> Weight<'a> {
 /// dequantize) becomes owned f32. use_f32 forces the dequantized path.
 pub fn load_weight<'a>(file: &'a GgufFile, name: &str, use_f32: bool) -> Result<Weight<'a>> {
     let (info, raw) = file.tensor(name)?;
-    let has_fused_kernel = matches!(info.dtype, GgmlType::Q8_0);
+    let has_fused_kernel = info.dtype == GgmlType::Q8_0
+        || crate::quant::block_dequant(info.dtype).is_some();
     if use_f32 || !has_fused_kernel {
         return Ok(Weight::F32(Tensor::from_gguf(file, name)?));
     }

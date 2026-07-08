@@ -208,6 +208,9 @@ impl GgmlType {
             GgmlType::F32 => Some((1, 4)),
             GgmlType::F16 => Some((1, 2)),
             GgmlType::Q8_0 => Some((crate::quant::QK8_0, crate::quant::Q8_0_BLOCK_BYTES)),
+            GgmlType::Q5_0 => Some((crate::quant::QK5_0, crate::quant::Q5_0_BLOCK_BYTES)),
+            GgmlType::Q4K => Some((crate::quant::QK_K, crate::quant::Q4_K_BLOCK_BYTES)),
+            GgmlType::Q6K => Some((crate::quant::QK_K, crate::quant::Q6_K_BLOCK_BYTES)),
             _ => None,
         }
     }

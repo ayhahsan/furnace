@@ -136,12 +136,14 @@ pub fn matmul_with(
     out
 }
 
-/// Dot product with 8 independent accumulator lanes. A single-accumulator
+/// Dot product with 8 independent accumulator lanes (pub(crate): the fused
+/// quantized kernels reuse it against stack-dequantized blocks).
+/// A single-accumulator
 /// loop is a serial float dependency chain the compiler must not reorder
 /// (float adds are not associative), so it can neither pipeline nor
 /// vectorize; independent lanes remove the chain at the cost of a different
 /// (grouped) summation order.
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
     let mut ca = a.chunks_exact(8);
     let mut cb = b.chunks_exact(8);
