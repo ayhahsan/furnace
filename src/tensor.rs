@@ -11,6 +11,7 @@
 
 use crate::gguf::GgufFile;
 use anyhow::Result;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct Tensor {
@@ -82,13 +83,21 @@ pub fn matmul(a: &Tensor, w: &Tensor) -> Tensor {
     );
     let _t = crate::perf::time(&crate::perf::MATMUL);
 
+    // Parallel over output positions: each chunk of the output row is a
+    // batch of independent dot products against consecutive weight rows.
+    // Chunked so one rayon task amortizes scheduling over 64 dots.
     let mut out = Tensor::zeros(vec![seq, d_out]);
     for s in 0..seq {
         let a_row = &a.data[s * d_in..(s + 1) * d_in];
-        for o in 0..d_out {
-            let w_row = &w.data[o * d_in..(o + 1) * d_in];
-            out.data[s * d_out + o] = dot(a_row, w_row);
-        }
+        out.data[s * d_out..(s + 1) * d_out]
+            .par_chunks_mut(64)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                for (j, dst) in chunk.iter_mut().enumerate() {
+                    let o = chunk_idx * 64 + j;
+                    *dst = dot(a_row, &w.data[o * d_in..(o + 1) * d_in]);
+                }
+            });
     }
     out
 }

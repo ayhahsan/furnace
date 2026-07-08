@@ -156,6 +156,18 @@ fn dump_tensor(model: &PathBuf, name: &str, offset: usize, count: usize) -> Resu
 }
 
 fn main() -> Result<()> {
+    // decode is memory-bandwidth-bound on this class of machine: measured
+    // best at 4 threads (more threads only contend for the single memory
+    // channel). RAYON_NUM_THREADS still overrides for experiments.
+    let threads = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .ok();
+
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect { model, metadata } => {
