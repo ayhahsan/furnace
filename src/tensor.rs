@@ -83,13 +83,12 @@ pub fn matmul(a: &Tensor, w: &Tensor) -> Tensor {
     );
     let _t = crate::perf::time(&crate::perf::MATMUL);
 
-    // Parallel over output positions: each chunk of the output row is a
-    // batch of independent dot products against consecutive weight rows.
-    // Chunked so one rayon task amortizes scheduling over 64 dots.
     let mut out = Tensor::zeros(vec![seq, d_out]);
-    for s in 0..seq {
-        let a_row = &a.data[s * d_in..(s + 1) * d_in];
-        out.data[s * d_out..(s + 1) * d_out]
+    if seq == 1 {
+        // decode: one activation row, parallel over output positions in
+        // chunks of 64 dots so a rayon task amortizes its scheduling
+        let a_row = &a.data[..d_in];
+        out.data
             .par_chunks_mut(64)
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
@@ -98,6 +97,28 @@ pub fn matmul(a: &Tensor, w: &Tensor) -> Tensor {
                     *dst = dot(a_row, &w.data[o * d_in..(o + 1) * d_in]);
                 }
             });
+    } else {
+        // prefill: weight rows are the memory traffic, so stream each ONCE
+        // and reuse it for every activation row (weight-row outer loop);
+        // compute transposed [d_out, seq] then flip into row-major output
+        let mut out_t = vec![0.0f32; d_out * seq];
+        out_t
+            .par_chunks_mut(64 * seq)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let o0 = chunk_idx * 64;
+                for (j, o_col) in chunk.chunks_exact_mut(seq).enumerate() {
+                    let w_row = &w.data[(o0 + j) * d_in..(o0 + j + 1) * d_in];
+                    for (s, dst) in o_col.iter_mut().enumerate() {
+                        *dst = dot(&a.data[s * d_in..(s + 1) * d_in], w_row);
+                    }
+                }
+            });
+        for s in 0..seq {
+            for o in 0..d_out {
+                out.data[s * d_out + o] = out_t[o * seq + s];
+            }
+        }
     }
     out
 }
