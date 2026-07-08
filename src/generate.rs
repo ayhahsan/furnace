@@ -116,6 +116,7 @@ pub fn generate(
         prefill * 1000.0 / prompt_ids.len() as f64
     );
 
+    crate::perf::reset(); // breakdown covers the decode phase only
     let mut decode_seconds = 0.0;
     let mut decode_steps = 0usize;
     for step in 0..max_new {
@@ -149,6 +150,7 @@ pub fn generate(
             decode_seconds * 1000.0 / decode_steps as f64
         );
     }
+    crate::perf::report("decode", decode_seconds * 1000.0);
     eprintln!("sampler: {} RNG draws", sampler.draws());
     eprintln!("generated ids: {:?}", generated);
     Ok(generated)

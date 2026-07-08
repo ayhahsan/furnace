@@ -1,6 +1,7 @@
 mod generate;
 mod gguf;
 mod model;
+mod perf;
 mod quant;
 mod sampler;
 mod selftest;
@@ -55,6 +56,9 @@ enum Command {
         /// RNG seed; omit for one drawn from the clock
         #[arg(long)]
         seed: Option<u64>,
+        /// Print a per-op time breakdown of the decode phase
+        #[arg(long)]
+        timings: bool,
     },
     /// Parse a GGUF file and dump its metadata and tensor table
     Inspect {
@@ -199,7 +203,10 @@ fn main() -> Result<()> {
         Command::SelftestM6 { model, file } => {
             selftest::run_m6(&model, &file)?;
         }
-        Command::Run { model, prompt, max_tokens, raw, no_cache, temp, top_k, top_p, repeat_penalty, seed } => {
+        Command::Run { model, prompt, max_tokens, raw, no_cache, temp, top_k, top_p, repeat_penalty, seed, timings } => {
+            if timings {
+                perf::enable();
+            }
             let t0 = std::time::Instant::now();
             let file = gguf::GgufFile::open(&model)?;
             let tok = tokenizer::Tokenizer::from_gguf(&file)?;

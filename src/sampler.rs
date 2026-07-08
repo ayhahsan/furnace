@@ -84,6 +84,7 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32], recent: &[u32]) -> u32 {
+        let _t = crate::perf::time(&crate::perf::SAMPLE);
         let mut lg = logits.to_vec();
         apply_repeat_penalty(&mut lg, recent, self.repeat_penalty);
 

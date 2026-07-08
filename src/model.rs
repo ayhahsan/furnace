@@ -130,6 +130,7 @@ pub fn rope(x: &mut Tensor, n_heads: usize, head_dim: usize, theta: f32, start_p
         "rope: row width {} != {} heads x {}",
         x.shape[1], n_heads, head_dim
     );
+    let _t = crate::perf::time(&crate::perf::ROPE);
     let half = head_dim / 2;
     for s in 0..seq {
         let row = &mut x.data[s * n_heads * head_dim..(s + 1) * n_heads * head_dim];
@@ -315,6 +316,7 @@ fn attention_scores_cached(
     let scale = 1.0 / (hd as f32).sqrt();
 
     let mut probs = Tensor::zeros(vec![nh, n_new, total]);
+    let t_scores = crate::perf::time(&crate::perf::ATTN_DOT);
     for h in 0..nh {
         let kv = h / group;
         for s in 0..n_new {
@@ -331,6 +333,7 @@ fn attention_scores_cached(
             }
         }
     }
+    drop(t_scores); // softmax accounts for itself
     tensor::softmax(&mut probs);
     probs
 }
@@ -347,6 +350,7 @@ fn attention_apply_cached(
     assert_eq!(v_cache.len(), total * kv_dim, "attention: bad v_cache length");
     let group = nh / nkv;
 
+    let _t = crate::perf::time(&crate::perf::ATTN_APPLY);
     let mut out = Tensor::zeros(vec![n_new, nh * hd]);
     for h in 0..nh {
         let kv = h / group;
@@ -407,6 +411,7 @@ pub fn layer_forward_cached(
 
 /// Token embedding lookup: copy row t of token_embd for each token.
 pub fn embed(embedding: &Tensor, tokens: &[u32]) -> Tensor {
+    let _t = crate::perf::time(&crate::perf::EMBED);
     let hidden = embedding.shape[1];
     let vocab = embedding.shape[0];
     let mut out = Tensor::zeros(vec![tokens.len(), hidden]);

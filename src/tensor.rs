@@ -80,6 +80,7 @@ pub fn matmul(a: &Tensor, w: &Tensor) -> Tensor {
         "matmul: inner dims differ: activation {:?} vs weight {:?} (weight must be [out, in])",
         a.shape, w.shape
     );
+    let _t = crate::perf::time(&crate::perf::MATMUL);
 
     let mut out = Tensor::zeros(vec![seq, d_out]);
     for s in 0..seq {
@@ -106,6 +107,7 @@ pub fn rmsnorm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
         "rmsnorm: weight shape {:?} does not match row length {}",
         weight.shape, cols
     );
+    let _t = crate::perf::time(&crate::perf::RMSNORM);
 
     let mut out = Tensor::zeros(x.shape.clone());
     for r in 0..n_rows {
@@ -122,6 +124,7 @@ pub fn rmsnorm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
 
 /// In-place row-wise softmax over the last dim, max-subtracted for stability.
 pub fn softmax(x: &mut Tensor) {
+    let _t = crate::perf::time(&crate::perf::SOFTMAX);
     let (n_rows, cols) = x.rows();
     for r in 0..n_rows {
         let row = &mut x.data[r * cols..(r + 1) * cols];
@@ -151,6 +154,7 @@ pub fn swiglu(gate: &Tensor, up: &Tensor) -> Tensor {
         "swiglu: gate shape {:?} vs up shape {:?}",
         gate.shape, up.shape
     );
+    let _t = crate::perf::time(&crate::perf::ELEMENTWISE);
     let data = gate
         .data
         .iter()
@@ -162,6 +166,7 @@ pub fn swiglu(gate: &Tensor, up: &Tensor) -> Tensor {
 
 pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
     assert_eq!(a.shape, b.shape, "add: shape {:?} vs {:?}", a.shape, b.shape);
+    let _t = crate::perf::time(&crate::perf::ELEMENTWISE);
     let data = a.data.iter().zip(&b.data).map(|(&x, &y)| x + y).collect();
     Tensor::from_vec(data, a.shape.clone())
 }
