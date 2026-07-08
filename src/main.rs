@@ -21,7 +21,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate text with greedy decoding
+    /// Generate text (greedy at --temp 0, sampled otherwise)
     Run {
         /// Path to the .gguf model file
         model: PathBuf,
