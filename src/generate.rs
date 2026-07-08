@@ -1,6 +1,7 @@
 // Greedy decoding loop with streaming UTF-8 output.
 
 use crate::model::{KvCache, Model};
+use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
 use anyhow::ensure;
 use anyhow::Result;
@@ -75,15 +76,17 @@ pub fn argmax(data: &[f32]) -> u32 {
     best as u32
 }
 
-/// Greedy decoding with a KV cache: prefill the prompt once, then decode
-/// one token per step. Streams text to stdout, reports ids and timing on
-/// stderr, and returns the generated ids.
+/// Sampled decoding with a KV cache: prefill the prompt once, then decode
+/// one token per step, choosing each via the sampler (which degenerates to
+/// exact greedy at temperature 0). Streams text to stdout, reports ids and
+/// timing on stderr, and returns the generated ids.
 pub fn generate(
     model: &Model,
     tokenizer: &Tokenizer,
     prompt_ids: Vec<u32>,
     max_new: usize,
     stop_ids: &[u32],
+    sampler: &mut Sampler,
 ) -> Result<Vec<u32>> {
     let max_ctx = model.config.context_length.min(4096);
     ensure!(
@@ -99,6 +102,7 @@ pub fn generate(
     );
 
     let mut generated = Vec::new();
+    let mut context = prompt_ids.clone();
     let mut stream = Utf8Stream::new();
     let mut stdout = std::io::stdout();
 
@@ -115,11 +119,13 @@ pub fn generate(
     let mut decode_seconds = 0.0;
     let mut decode_steps = 0usize;
     for step in 0..max_new {
-        let next = argmax(&logits.data);
+        let window = context.len().saturating_sub(sampler.repeat_window);
+        let next = sampler.sample(&logits.data, &context[window..]);
         if stop_ids.contains(&next) {
             break;
         }
         generated.push(next);
+        context.push(next);
         print!("{}", stream.push(&tokenizer.token_bytes(next)?));
         stdout.flush()?;
         if step + 1 == max_new {
@@ -143,12 +149,13 @@ pub fn generate(
             decode_seconds * 1000.0 / decode_steps as f64
         );
     }
+    eprintln!("sampler: {} RNG draws", sampler.draws());
     eprintln!("generated ids: {:?}", generated);
     Ok(generated)
 }
 
-/// M6 reference path: full recompute every step, no cache. Kept as the
-/// ground truth the cached path must match byte for byte.
+/// M6 reference path: full recompute every step, no cache, pure argmax.
+/// Kept as the ground truth the cached path must match byte for byte.
 pub fn generate_uncached(
     model: &Model,
     tokenizer: &Tokenizer,

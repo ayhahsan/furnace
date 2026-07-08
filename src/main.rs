@@ -2,6 +2,7 @@ mod generate;
 mod gguf;
 mod model;
 mod quant;
+mod sampler;
 mod selftest;
 mod tensor;
 mod tokenizer;
@@ -34,9 +35,26 @@ enum Command {
         #[arg(long)]
         raw: bool,
         /// Use the M6 full-recompute path instead of the KV cache
-        /// (reference implementation; slow)
+        /// (reference implementation; slow, always pure greedy)
         #[arg(long)]
         no_cache: bool,
+        /// Sampling temperature; 0 = greedy (deterministic argmax)
+        #[arg(long, default_value_t = 0.7)]
+        temp: f32,
+        /// Keep only the k most likely tokens; 0 disables
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        /// Nucleus sampling: keep the smallest set with cumulative
+        /// probability >= p; 1.0 disables
+        #[arg(long, default_value_t = 0.9)]
+        top_p: f32,
+        /// Penalty for tokens seen in the last 64 positions; 1.0 disables
+        /// (default off so temp 0 exactly matches greedy)
+        #[arg(long, default_value_t = 1.0)]
+        repeat_penalty: f32,
+        /// RNG seed; omit for one drawn from the clock
+        #[arg(long)]
+        seed: Option<u64>,
     },
     /// Parse a GGUF file and dump its metadata and tensor table
     Inspect {
@@ -181,7 +199,7 @@ fn main() -> Result<()> {
         Command::SelftestM6 { model, file } => {
             selftest::run_m6(&model, &file)?;
         }
-        Command::Run { model, prompt, max_tokens, raw, no_cache } => {
+        Command::Run { model, prompt, max_tokens, raw, no_cache, temp, top_k, top_p, repeat_penalty, seed } => {
             let t0 = std::time::Instant::now();
             let file = gguf::GgufFile::open(&model)?;
             let tok = tokenizer::Tokenizer::from_gguf(&file)?;
@@ -205,7 +223,19 @@ fn main() -> Result<()> {
             if no_cache {
                 generate::generate_uncached(&m, &tok, ids, max_tokens, &stop_ids)?;
             } else {
-                generate::generate(&m, &tok, ids, max_tokens, &stop_ids)?;
+                let seed = seed.unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0)
+                        ^ std::process::id() as u64
+                });
+                eprintln!(
+                    "sampler: temp {} top-k {} top-p {} repeat-penalty {} seed {}",
+                    temp, top_k, top_p, repeat_penalty, seed
+                );
+                let mut sampler = sampler::Sampler::new(temp, top_k, top_p, repeat_penalty, seed);
+                generate::generate(&m, &tok, ids, max_tokens, &stop_ids, &mut sampler)?;
             }
         }
     }
