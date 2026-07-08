@@ -99,10 +99,9 @@ impl<'a> Weight<'a> {
     pub fn matmul(&self, x: &Tensor) -> Tensor {
         match self {
             Weight::F32(t) => tensor::matmul(x, t),
-            Weight::Quant { raw, dtype, out, inn } => match dtype {
-                GgmlType::Q8_0 => crate::quant::matmul_q8_0(x, raw, *out, *inn),
-                other => crate::quant::matmul_blocks(x, raw, *out, *inn, *other),
-            },
+            Weight::Quant { raw, dtype, out, inn } => {
+                crate::quant::matmul_quant(x, raw, *out, *inn, *dtype)
+            }
         }
     }
 }

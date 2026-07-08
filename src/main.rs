@@ -160,13 +160,16 @@ fn dump_tensor(model: &PathBuf, name: &str, offset: usize, count: usize) -> Resu
 }
 
 fn main() -> Result<()> {
-    // decode is memory-bandwidth-bound on this class of machine: measured
-    // best at 4 threads (more threads only contend for the single memory
-    // channel). RAYON_NUM_THREADS still overrides for experiments.
+    // fused quantized kernels (the default path) move few enough bytes that
+    // decode scales with cores; measured best at all logical cores. The
+    // --f32 reference path saturates the memory channel earlier and prefers
+    // fewer -- RAYON_NUM_THREADS overrides for that or any experiment.
     let threads = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        });
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()

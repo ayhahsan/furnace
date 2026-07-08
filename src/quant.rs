@@ -166,21 +166,50 @@ fn dequantize_blocks(raw: &[u8], n_elements: usize, dtype: GgmlType) -> Result<V
     Ok(out)
 }
 
-/// Fused block-quant matmul: dequantize one block at a time into a stack
-/// buffer (L1-resident, never in RAM) and dot it against the activation
-/// slice. RAM traffic stays at quantized size.
-pub fn matmul_blocks(
+/// Fused block-quant matmul for any dtype with a block dequantizer.
+pub fn matmul_quant(
     a: &crate::tensor::Tensor,
     raw: &[u8],
     d_out: usize,
     d_in: usize,
     dtype: GgmlType,
 ) -> crate::tensor::Tensor {
-    let (block_elems, block_bytes, dequant) =
-        block_dequant(dtype).unwrap_or_else(|| panic!("no fused kernel for {:?}", dtype));
+    // one monomorphized instantiation per dtype so the block dequantizer
+    // inlines into the kernel loop (a fn pointer would be an indirect call
+    // per block)
+    match dtype {
+        GgmlType::Q8_0 => matmul_q8_0(a, raw, d_out, d_in),
+        GgmlType::Q5_0 => {
+            matmul_blocks(a, raw, d_out, d_in, QK5_0, Q5_0_BLOCK_BYTES, dequant_block_q5_0)
+        }
+        GgmlType::Q4K => {
+            matmul_blocks(a, raw, d_out, d_in, QK_K, Q4_K_BLOCK_BYTES, dequant_block_q4_k)
+        }
+        GgmlType::Q6K => {
+            matmul_blocks(a, raw, d_out, d_in, QK_K, Q6_K_BLOCK_BYTES, dequant_block_q6_k)
+        }
+        other => panic!("no fused matmul kernel for {:?}", other),
+    }
+}
+
+/// Shared fused kernel: dequantize one block at a time into a stack buffer
+/// (L1-resident, never in RAM) and dot it against the activation slice.
+/// RAM traffic stays at quantized size.
+fn matmul_blocks<F>(
+    a: &crate::tensor::Tensor,
+    raw: &[u8],
+    d_out: usize,
+    d_in: usize,
+    block_elems: usize,
+    block_bytes: usize,
+    dequant: F,
+) -> crate::tensor::Tensor
+where
+    F: Fn(&[u8], &mut [f32]) + Sync,
+{
     assert!(d_in % block_elems == 0, "matmul: in dim {} not a multiple of {}", d_in, block_elems);
     let row_bytes = d_in / block_elems * block_bytes;
-    assert_eq!(raw.len(), d_out * row_bytes, "matmul: bad weight byte count for {:?}", dtype);
+    assert_eq!(raw.len(), d_out * row_bytes, "matmul: bad weight byte count");
 
     crate::tensor::matmul_with(a, d_out, d_in, |o, a_row| {
         let row = &raw[o * row_bytes..(o + 1) * row_bytes];
@@ -417,7 +446,7 @@ mod tests {
             vec![2, QK_K],
         );
         let reference = crate::tensor::matmul(&x, &w);
-        let fused = matmul_blocks(&x, &raw, 2, QK_K, GgmlType::Q4K);
+        let fused = matmul_quant(&x, &raw, 2, QK_K, GgmlType::Q4K);
         assert_eq!(fused.shape, reference.shape);
         for (f, r) in fused.data.iter().zip(&reference.data) {
             assert!((f - r).abs() <= 1e-3 * r.abs().max(1.0), "fused {} vs ref {}", f, r);

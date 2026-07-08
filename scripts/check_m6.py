@@ -44,17 +44,23 @@ def weight_map(n_layers):
 
 
 def build_model(gguf_path, config_dir):
+    reader = GGUFReader(gguf_path)
+    by_name = {t.name: t for t in reader.tensors}
+
     config = AutoConfig.from_pretrained(config_dir)
-    config.tie_word_embeddings = False  # GGUF stores output.weight separately
+    # files with a separate output.weight need the tie broken; tied models
+    # (e.g. 1.5B) omit it from the GGUF and lm_head follows the embedding
+    config.tie_word_embeddings = "output.weight" not in by_name
     torch.set_default_dtype(torch.float32)
     model = AutoModelForCausalLM.from_config(config).float()
     model.eval()
     assert next(model.parameters()).dtype == torch.float32
 
-    reader = GGUFReader(gguf_path)
-    by_name = {t.name: t for t in reader.tensors}
     with torch.no_grad():
         for gguf_name, hf_name in weight_map(config.num_hidden_layers).items():
+            if gguf_name not in by_name:
+                assert gguf_name == "output.weight", f"missing {gguf_name}"
+                continue
             t = by_name[gguf_name]
             if t.tensor_type.name == "F32":
                 arr = np.asarray(t.data, dtype=np.float32).reshape(-1)
