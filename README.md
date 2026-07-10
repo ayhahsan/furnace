@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="furnace: an LLM inference engine from scratch in Rust" width="100%">
+  <img src="https://raw.githubusercontent.com/ayhahsan/furnace/main/assets/banner.png" alt="furnace: an LLM inference engine from scratch in Rust" width="100%">
 </p>
 
 # furnace
@@ -20,7 +20,7 @@ Most of us use inference engines as black boxes. furnace is the opposite: every 
 ## Architecture
 
 <p align="center">
-  <img src="assets/architecture.svg" alt="Pipeline: GGUF mmap to parser, tokenizer and fused quantized kernels, transformer with KV cache, sampler, streamed text. Every stage verified against a reference." width="100%">
+  <img src="https://raw.githubusercontent.com/ayhahsan/furnace/main/assets/architecture.png" alt="Pipeline: GGUF mmap to parser, tokenizer and fused quantized kernels, transformer with KV cache, sampler, streamed text. Every stage verified against a reference." width="100%">
 </p>
 
 - **`gguf.rs`** — bounds-checked GGUF parser over `mmap`: header, metadata tree, tensor table. Everything downstream is config-driven from this metadata; moving from a 24-layer 0.5B model to a 28-layer 1.5B model with different GQA geometry required zero code changes.
